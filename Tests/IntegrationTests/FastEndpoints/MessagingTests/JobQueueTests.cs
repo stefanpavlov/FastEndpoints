@@ -204,4 +204,49 @@ public class JobQueueTests(Sut App) : TestBase<Sut>
         JobTestGenericCommand<SomeEvent>.CompletedIDs.Contains(1);
         JobStorage.Jobs.Clear();
     }
+
+    [Fact, Priority(9)]
+    public async Task Job_Sliding_Window_Concurrency()
+    {
+        // Verifies that when a job completes, its slot is immediately available for a new job
+        // without waiting for other in-flight jobs to finish (sliding window vs batch-and-wait).
+        //
+        // Setup: MaxConcurrency = 2 for this command type.
+        // Job 1: slow (2000ms), Job 2: fast (100ms), Job 3: queued after Job 2 finishes.
+        // With sliding window: Job 3 starts while Job 1 is still running.
+        // With batch-and-wait: Job 3 can't start until Job 1 finishes.
+
+        var cts = new CancellationTokenSource(10000);
+        JobConcurrencyTestCommand.ExecutionLog.Clear();
+        Interlocked.Exchange(ref JobConcurrencyTestCommand.CompletedCount, 0);
+
+        await new JobConcurrencyTestCommand { Id = 1, DelayMs = 2000 }.QueueJobAsync(ct: cts.Token);
+        await new JobConcurrencyTestCommand { Id = 2, DelayMs = 100 }.QueueJobAsync(ct: cts.Token);
+
+        // wait for Job 2 to finish and its slot to free up
+        await Task.Delay(500, cts.Token);
+
+        await new JobConcurrencyTestCommand { Id = 3, DelayMs = 100 }.QueueJobAsync(ct: cts.Token);
+
+        while (!cts.IsCancellationRequested && Volatile.Read(ref JobConcurrencyTestCommand.CompletedCount) < 3)
+            await Task.Delay(100, cts.Token);
+
+        Volatile.Read(ref JobConcurrencyTestCommand.CompletedCount).ShouldBe(3);
+
+        var log = JobConcurrencyTestCommand.ExecutionLog;
+        log.ContainsKey(1).ShouldBeTrue();
+        log.ContainsKey(2).ShouldBeTrue();
+        log.ContainsKey(3).ShouldBeTrue();
+
+        // Job 3 filled the slot freed by Job 2 (causal chain: Job 2 ends → slot frees → Job 3 starts)
+        var job2End = log[2].EndTicks;
+        var job3Start = log[3].StartTicks;
+        job3Start.ShouldBeGreaterThan(job2End);
+
+        // Job 3 started before Job 1 ended (proving sliding window, not batch-and-wait)
+        var job1End = log[1].EndTicks;
+        job3Start.ShouldBeLessThan(job1End);
+
+        JobStorage.Jobs.Clear();
+    }
 }
