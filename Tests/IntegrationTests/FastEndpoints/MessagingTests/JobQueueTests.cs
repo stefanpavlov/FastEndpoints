@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using TestCases.EventHandlingTest;
 using TestCases.JobQueueTest;
 
@@ -206,6 +207,42 @@ public class JobQueueTests(Sut App) : TestBase<Sut>
     }
 
     [Fact, Priority(9)]
+    public async Task Job_Parallel_Execution()
+    {
+        // Verifies that a second job starts while the first is still running,
+        // without waiting for the storage probe interval.
+        //
+        // Setup: MaxConcurrency = 2, StorageProbeDelay = 100ms.
+        // Job 1: slow (2000ms), Job 2: fast (100ms), both queued together.
+        // Job 2 must start before Job 1 finishes and within 500ms of queuing
+        // (well under the 2000ms Job 1 duration).
+
+        var cts = new CancellationTokenSource(10000);
+        JobConcurrencyTestCommand.ExecutionLog.Clear();
+        Interlocked.Exchange(ref JobConcurrencyTestCommand.CompletedCount, 0);
+
+        var queuedAt = Stopwatch.GetTimestamp();
+        await new JobConcurrencyTestCommand { Id = 1, DelayMs = 2000 }.QueueJobAsync(ct: cts.Token);
+        await new JobConcurrencyTestCommand { Id = 2, DelayMs = 100 }.QueueJobAsync(ct: cts.Token);
+
+        while (!cts.IsCancellationRequested && Volatile.Read(ref JobConcurrencyTestCommand.CompletedCount) < 2)
+            await Task.Delay(100, cts.Token);
+
+        Volatile.Read(ref JobConcurrencyTestCommand.CompletedCount).ShouldBe(2);
+
+        var log = JobConcurrencyTestCommand.ExecutionLog;
+
+        // Job 2 started while Job 1 was still running (parallel, not serial)
+        log[2].StartTicks.ShouldBeLessThan(log[1].EndTicks);
+
+        // Job 2 started promptly — within 500ms of queuing (semaphore wake, not probe delay)
+        var job2Latency = Stopwatch.GetElapsedTime(queuedAt, log[2].StartTicks);
+        job2Latency.ShouldBeLessThan(TimeSpan.FromMilliseconds(500));
+
+        JobStorage.Jobs.Clear();
+    }
+
+    [Fact, Priority(10)]
     public async Task Job_Sliding_Window_Concurrency()
     {
         // Verifies that when a job completes, its slot is immediately available for a new job
