@@ -7,6 +7,12 @@ using FastEndpoints.JobsQueues;
 
 namespace FastEndpoints;
 
+enum DispatchStatus : byte
+{
+    InFlight = 0,
+    Complete = 1
+}
+
 [UnconditionalSuppressMessage("aot", "IL2090")]
 abstract class JobQueueBase
 {
@@ -112,11 +118,14 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
     public static readonly string QueueID = _tCommandName.ToHash();
 
     readonly ConcurrentDictionary<Guid, CancellationTokenSource?> _cancellations = new();
-    readonly ParallelOptions _parallelOptions = new() { MaxDegreeOfParallelism = Environment.ProcessorCount };
+    readonly ConcurrentDictionary<Guid, DispatchStatus> _dispatched = new();
+    int _maxConcurrency = Environment.ProcessorCount;
     readonly CancellationToken _appCancellation;
     readonly TStorageProvider _storage;
     readonly IJobResultProvider? _resultStorage;
     readonly SemaphoreSlim _sem = new(0);
+    readonly TaskCompletionSource _drainTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    int _availableSlots;
     readonly ILogger _log;
     bool _activated; // when false, the executor blocks indefinitely on the semaphore (no DB polling)
     readonly bool _isDistributed;
@@ -134,7 +143,6 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
         _isDistributed = storageProvider.DistributedJobProcessingEnabled;
         _activated = _isDistributed;
         _appCancellation = appLife.ApplicationStopping;
-        _parallelOptions.CancellationToken = _appCancellation;
         _log = logger;
         _nextCleanupOn = DateTime.UtcNow.AddMinutes(5);
         JobStorage<TStorageRecord, TStorageProvider>.Provider = _storage;
@@ -145,7 +153,8 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
 
     internal override void SetLimits(int concurrencyLimit, TimeSpan executionTimeLimit, TimeSpan semWaitLimit)
     {
-        _parallelOptions.MaxDegreeOfParallelism = concurrencyLimit;
+        _maxConcurrency = concurrencyLimit;
+        _availableSlots = concurrencyLimit;
         _executionTimeLimit = executionTimeLimit;
         _semWaitLimit = semWaitLimit;
         _ = CommandExecutorTask();
@@ -279,7 +288,7 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
                 records = await _storage.GetNextBatchAsync(
                               new()
                               {
-                                  Limit = _parallelOptions.MaxDegreeOfParallelism,
+                                  Limit = _maxConcurrency,
                                   QueueID = QueueID,
                                   CancellationToken = _appCancellation,
                                   ExecutionTimeLimit = _executionTimeLimit,
@@ -310,18 +319,33 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
 
             try
             {
+                var dispatchedCount = 0;
+
                 if (records.Count > 0)
                 {
                     _activated = true;
-                    await Parallel.ForEachAsync(records, _parallelOptions, ExecuteCommand);
+
+                    foreach (var record in records)
+                    {
+                        if (Volatile.Read(ref _availableSlots) <= 0)
+                            break; // no free slots, wait for a job to complete
+
+                        if (!_dispatched.TryAdd(record.TrackingID, DispatchStatus.InFlight))
+                            continue; // already dispatched, skip
+
+                        Interlocked.Decrement(ref _availableSlots);
+                        dispatchedCount++;
+                        _ = RunJob(record);
+                    }
                 }
 
-                if (fetchedCount < _parallelOptions.MaxDegreeOfParallelism)
+                if (dispatchedCount == 0 || fetchedCount < _maxConcurrency)
                 {
                     // when activated (distributed mode, or jobs have been found), wait with a timeout so we periodically re-check for future jobs
                     // becoming due or jobs added by other distributed workers.
                     // when not activated (non-distributed with no jobs found yet), block indefinitely to avoid pointless DB polling.
                     // TriggerJob() sets _activated=true and releases the semaphore when the first job is queued.
+                    // RunJob() also releases the semaphore when a job completes, to wake the loop to fill the freed slot.
                     await _sem.WaitAsync(_activated ? _semWaitLimit : Timeout.InfiniteTimeSpan, _appCancellation);
                 }
             }
@@ -339,8 +363,6 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
                 continue;
             }
 
-            // else there are more records than the page size, so continue next iteration
-
             // cleanup any cancellations that have been marked canceled in storage
             if (DateTime.UtcNow >= _nextCleanupOn)
             {
@@ -353,13 +375,44 @@ sealed class JobQueue<TCommand, TResult, TStorageRecord, TStorageProvider> : Job
                 _nextCleanupOn = DateTime.UtcNow.AddMinutes(5);
             }
 
+            // clean up dispatch tracking for completed jobs.
+            // entries stay as InFlight until RunJob finishes (after storage marks them complete),
+            // so re-fetch can't return a record whose tracking entry was already removed.
+            foreach (var kv in _dispatched)
+            {
+                if (kv.Value == DispatchStatus.Complete)
+                    _dispatched.TryRemove(kv.Key, out _);
+            }
+
             // ReSharper disable once MethodHasAsyncOverloadWithCancellation
             // reset/drain _sem CurrentCount to 0 in case multiple releases happened
             // passing app cancellation here is not needed as it's an immediate return.
             while (_sem.Wait(0)) { }
         }
 
-        async ValueTask ExecuteCommand(TStorageRecord record, CancellationToken _)
+        // wait for in-flight jobs to complete before exiting, so that retry loops
+        // in ExecuteCommand can run at least once before the host disposes dependencies.
+        if (Volatile.Read(ref _availableSlots) < _maxConcurrency)
+            await _drainTcs.Task;
+
+        async Task RunJob(TStorageRecord record)
+        {
+            try
+            {
+                await ExecuteCommand(record);
+            }
+            finally
+            {
+                _dispatched.TryUpdate(record.TrackingID, DispatchStatus.Complete, DispatchStatus.InFlight);
+
+                if (Interlocked.Increment(ref _availableSlots) == _maxConcurrency && _appCancellation.IsCancellationRequested)
+                    _drainTcs.TrySetResult(); // signal shutdown drain
+
+                _sem.Release(); // wake the main loop to fill the freed slot
+            }
+        }
+
+        async ValueTask ExecuteCommand(TStorageRecord record)
         {
             // ReSharper disable once HeapView.CanAvoidClosure
             using var cts = _cancellations.GetOrAdd(
